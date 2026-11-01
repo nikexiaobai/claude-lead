@@ -75,6 +75,7 @@ claude-lead/
 ├── references/
 │   ├── prompts.md                # 实施、审查返工、继续和交付模板
 │   ├── desktop.md                # 调度、审批和恢复说明
+│   ├── verification.md           # mentor 运行时验收基线
 │   └── connection-checklist.md   # 连接故障分类与执行前检查
 └── scripts/
     ├── desktop.py                # doctor / backend / serve / send / recover / watch
@@ -92,7 +93,7 @@ claude-lead/
 
 - `task.json`：项目、会话和实际权限绑定。
 - 每轮独立目录：`request.md`、`state.json`、`result.json`、简要事件及必要错误记录。
-- 审批文件绑定对应请求，由用户逐条决定，不永久放行。
+- 审批按混合策略：只读命令由白名单自动放行并记入 `decisions.jsonl`；写文件、提交推送、删除和网络请求生成审批文件，由用户逐条决定，不永久放行。
 
 项目任务文件正文原样发送到桌面；调度证据不拼接进提示词。断线先核对原回合，不重复发送。mentor审查实际diff与验证结果，不以进程退出0代替完成。
 

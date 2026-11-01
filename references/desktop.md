@@ -52,11 +52,24 @@ python3 -X utf8 -I -B <skill>/scripts/desktop.py send \
 
 `send` 成功返回 `turn_started` 后即结束本轮。不得启动 `watch`、后台 monitor、通知订阅或其他轮询，也不得自动调用 `recover`。向用户说明任务已发送，并等待用户明确发送“继续”。收到“继续”后，才读取原 task 的准确 thread/turn 状态；每次再次发送消息后都立即停止等待。`watch` 仅供用户明确要求检查进度时手动使用。
 
-## 3. 审批：逐请求，不自动授权
+`send` 结束即断开连接，运行中产生的审批请求不会自己送到mentor。需要在回合进行中接管审批时，用`recover --task <task目录> --relay <秒>`：它重连后单次阻塞等待该回合，期间自动放行只读命令、其余请求落成审批文件等用户决定，超时打印`relay_timeout`并如实报告，不轮询、不重发任务。
+
+## 3. 审批：只读自动放行，其余逐请求
 
 工具支持commandExecution和fileChange两类`decision`审批结构；接口兼容性按当前桌面版本与Schema核对，不猜新接口。其他请求（权限扩展、登录、用户输入工具等）默认不授予，报告不支持，不换执行者绕过。
 
-每个待审批请求生成`approval-<digest>.json`，绑定thread、turn及完整请求。mentor读请求，向用户呈现准确command/cwd/原因或文件变更，取得**该请求的真实决定**后，才用Write写请求中指定的decisionFile：
+**混合策略**：commandExecution请求先过只读白名单，下列条件全部满足才由mentor自动放行，任一不满足就交给用户：
+
+- `kind`为`command`（`writeStdin`不放行）；
+- 没有`networkApprovalContext`（网络请求一律不放行）；
+- `commandActions`若存在，每一项都是`read`/`listFiles`/`search`；
+- `command`命中白名单，且不含`; | & < > 反引号 $ ( )`、不写`--output`、首词不是绝对路径。
+
+白名单只覆盖`git status/diff/log/show/blame`、`git branch/tag/remote/stash/config --get`的查询形式、`ls/cat/head/tail/rg/grep/find`（`find`禁用`-delete/-exec`），以及`npm test`、`pytest`、`go test`、`cargo check`等测试命令。`git push/commit/checkout/reset/clean/stash drop`、任何写文件或改工作区的命令、网络请求都不在名单内。fileChange请求永不自动放行。
+
+自动放行打印`approval_auto_accepted`并写入`decisions.jsonl`（`source: mentor-auto-readonly`）。它只表示"该命令被判定为只读"，不等于用户授权；用户决定同样记账（`source: explicit-user-answer`）。用`--auto-approve none`可整条关闭自动放行，回到全人工。
+
+其余请求生成`approval-<digest>.json`，绑定thread、turn及完整请求。mentor读请求，向用户呈现准确command/cwd/原因或文件变更，取得**该请求的真实决定**后，才用Write写请求中指定的decisionFile：
 
 ```json
 {

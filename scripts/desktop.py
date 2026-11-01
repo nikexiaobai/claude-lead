@@ -6,6 +6,7 @@ import importlib.metadata
 import inspect
 import json
 import re
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +17,130 @@ from urllib.parse import urlparse
 
 TERMINAL = {'completed', 'failed', 'interrupted'}
 APPROVALS = {'item/commandExecution/requestApproval', 'item/fileChange/requestApproval'}
+AUTO_SOURCE = 'mentor-auto-readonly'
+SHELL_META = set(';|&<>`$()\r\n')
+# 白名单只放能确定不改工作区的命令；其余一律留给用户决定。
+READ_ONLY_COMMANDS = {
+    'ls', 'pwd', 'cat', 'head', 'tail', 'wc', 'file', 'stat', 'du', 'df',
+    'tree', 'nl', 'cut', 'sort', 'uniq', 'tr', 'basename', 'dirname',
+    'realpath', 'readlink', 'echo', 'printf', 'date', 'uname', 'whoami',
+    'id', 'diff', 'rg', 'grep', 'ag', 'which',
+}
+GIT_READ_SUBCOMMANDS = {
+    'status', 'diff', 'log', 'show', 'blame', 'annotate', 'shortlog',
+    'rev-parse', 'rev-list', 'ls-files', 'ls-tree', 'cat-file', 'describe',
+    'diff-tree', 'diff-index', 'diff-files', 'whatchanged', 'reflog', 'grep',
+    'merge-base', 'count-objects', 'var',
+}
+GIT_BRANCH_FLAGS = {'-l', '--list', '-a', '--all', '-r', '--remotes', '-v', '-vv',
+                    '--show-current', '--contains', '--merged', '--no-merged',
+                    '--points-at', '--format'}
+FORBIDDEN_FIND = {'-delete', '-exec', '-execdir', '-ok', '-okdir',
+                  '-fprint', '-fprint0', '-fprintf', '-fls'}
+TEST_RUNNERS = {'pytest', 'jest', 'vitest', 'phpunit', 'rspec', 'mocha', 'tox'}
+# 只读也会把内容送进对话记录，凭据类文件一律不自动放行。
+SENSITIVE_NAMES = {'.env', '.netrc', '.npmrc', '.pypirc', '.git-credentials',
+                   'credentials', 'credentials.json', 'auth.json',
+                   'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519'}
+SENSITIVE_SUFFIXES = ('.pem', '.key', '.p12', '.pfx', '.keystore')
+SENSITIVE_PARTS = ('/.ssh/', '/.aws/', '/.gnupg/', '/.codex/', '/.config/gh/')
+
+
+def git_read_only(args):
+    if not args:
+        return False
+    sub, rest = args[0], args[1:]
+    if sub in GIT_READ_SUBCOMMANDS:
+        return True
+    if sub == 'branch':
+        return all(a.startswith('-') and a.split('=')[0] in GIT_BRANCH_FLAGS for a in rest)
+    if sub == 'tag':
+        return not rest or rest[0] in ('-l', '--list', '-n')
+    if sub == 'remote':
+        return not rest or rest[0] in ('-v', '--verbose', 'show', 'get-url')
+    if sub == 'stash':
+        return rest[:1] in (['list'], ['show'])
+    if sub == 'config':
+        return bool(rest) and rest[0] in ('--get', '--get-all', '--get-regexp', '--list', '-l')
+    if sub == 'worktree':
+        return rest[:1] == ['list']
+    if sub == 'submodule':
+        return rest[:1] in (['status'], ['summary'])
+    return False
+
+
+def test_command(tokens):
+    head, rest = tokens[0], tokens[1:]
+    if head in TEST_RUNNERS:
+        return True
+    if head in ('npm', 'pnpm', 'yarn', 'bun') and rest:
+        return rest[0] in ('test', 't') or (
+            rest[0] == 'run' and len(rest) > 1 and rest[1].startswith('test'))
+    if head in ('python', 'python3') and rest[:2] in (['-m', 'pytest'], ['-m', 'unittest']):
+        return True
+    if head == 'node' and rest[:1] == ['--test']:
+        return True
+    if head in ('go', 'cargo', 'mvn', 'gradle', 'dotnet', 'make') and rest[:1] in (
+            ['test'], ['check']):
+        return True
+    return False
+
+
+def sensitive_token(token):
+    name = token.rsplit('/', 1)[-1].lower()
+    return (name in SENSITIVE_NAMES or name.startswith('.env.')
+            or name.endswith(SENSITIVE_SUFFIXES)
+            or any(part in token.lower() for part in SENSITIVE_PARTS))
+
+
+def read_only_command(command):
+    if not command or len(command) > 2000 or any(c in command for c in SHELL_META):
+        return False
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if not tokens or '/' in tokens[0]:
+        return False
+    if any(t.startswith(('--output', '--to-file')) or sensitive_token(t) for t in tokens):
+        return False
+    head, args = tokens[0], tokens[1:]
+    if head == 'git':
+        return git_read_only(args)
+    if head == 'find':
+        return not any(a in FORBIDDEN_FIND for a in args)
+    if head == 'diff':
+        return not any(a in ('-o', '--output', '--to-file') for a in args)
+    if head in ('sort', 'tree') and '-o' in args:
+        return False
+    if test_command(tokens):
+        return True
+    return head in READ_ONLY_COMMANDS
+
+
+def auto_approval(event):
+    """只读命令自动放行；其余返回 None，交给用户逐条决定。"""
+    params = event.get('params') or {}
+    if event.get('method') != 'item/commandExecution/requestApproval':
+        return None
+    if params.get('kind', 'command') != 'command' or params.get('networkApprovalContext'):
+        return None
+    actions = params.get('commandActions')
+    if actions and any(a.get('type') not in ('read', 'listFiles', 'search') for a in actions):
+        return None
+    command = params.get('command')
+    if not read_only_command(command):
+        return None
+    return {'decision': 'accept', 'reason': 'read-only allowlist: ' + command[:200]}
+
+
+def now():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def append_decision(run, record):
+    with (run / 'decisions.jsonl').open('a', encoding='utf-8') as log:
+        log.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
 def write_json(path, data):
@@ -180,7 +305,9 @@ def final_message(turn):
 
 
 class Rpc:
-    def __init__(self, url, run=None, thread=None):
+    auto_approve = False
+
+    def __init__(self, url, run=None, thread=None, auto_approve=False):
         from websockets.sync.client import connect
         self.connection = connect(local_url(url), proxy=None, open_timeout=5,
                                   close_timeout=2, ping_interval=None,
@@ -188,6 +315,7 @@ class Rpc:
         self.ws = self.connection.__enter__()
         self.run = run
         self.thread = thread
+        self.auto_approve = auto_approve
         self.sequence = 0
         self.events = deque()
         try:
@@ -215,6 +343,17 @@ class Rpc:
             answer = self.run / ('decision-' + digest[:16] + '.json')
             write_json(request, {'digest': digest, 'threadId': self.thread,
                                  'request': event, 'decisionFile': str(answer)})
+            automatic = auto_approval(event) if self.auto_approve else None
+            if automatic:
+                append_decision(self.run, {'at': now(), 'digest': digest,
+                                           'threadId': self.thread, 'method': event['method'],
+                                           'source': AUTO_SOURCE, 'decision': automatic['decision'],
+                                           'reason': automatic['reason']})
+                self.ws.send(json.dumps({'id': event['id'],
+                                         'result': {'decision': automatic['decision']}}))
+                print(json.dumps({'event': 'approval_auto_accepted', 'file': str(request),
+                                  'reason': automatic['reason']}, ensure_ascii=False), flush=True)
+                return {'method': 'mentor/decisionRelayed', 'params': {'threadId': self.thread}}
             print(json.dumps({'event': 'approval_pending', 'file': str(request)}), flush=True)
             end = time.monotonic() + 3600
             while time.monotonic() < end:
@@ -224,6 +363,10 @@ class Rpc:
                             or data.get('source') != 'explicit-user-answer'
                             or data.get('decision') not in ('accept', 'decline', 'cancel')):
                         raise RuntimeError('审批决定身份或类型不匹配，不自动放行')
+                    append_decision(self.run, {'at': now(), 'digest': digest,
+                                               'threadId': self.thread, 'method': event['method'],
+                                               'source': data['source'],
+                                               'decision': data['decision'], 'reason': 'user'})
                     self.ws.send(json.dumps({'id': event['id'], 'result': {
                         'decision': data['decision']}}))
                     return {'method': 'mentor/decisionRelayed', 'params': {'threadId': self.thread}}
@@ -326,7 +469,8 @@ def send(args):
     try:
         run.mkdir()
         (run / 'request.md').write_text(prompt, encoding='utf-8')
-        rpc = Rpc(args.url, run=run, thread=manifest.get('threadId'))
+        rpc = Rpc(args.url, run=run, thread=manifest.get('threadId'),
+                  auto_approve=args.auto_approve == 'readonly')
         if manifest:
             check_resume(rpc.read_thread(), manifest, project)
             data = rpc.call('thread/resume', {'threadId': rpc.thread, 'cwd': str(project),
@@ -370,15 +514,26 @@ def send(args):
 def recover(args):
     path = Path(args.task).resolve() / 'task.json'
     manifest = json.loads(path.read_text(encoding='utf-8'))
-    rpc = Rpc(manifest['url'], thread=manifest['threadId'])
+    run = Path(manifest['run'])
+    rpc = Rpc(manifest['url'], run=run, thread=manifest['threadId'],
+              auto_approve=args.auto_approve == 'readonly')
     try:
         thread = rpc.read_thread()
         turns = thread.get('turns', [])
         turn_id = manifest.get('turnId')
         # turn/start应答丢失时仅展示候选历史，不能猜测最新回合就是本次。
         turn = next((t for t in turns if t['id'] == turn_id), None) if manifest['phase'] != 'starting' else None
+        if args.relay and turn and turn.get('status') not in TERMINAL:
+            # 单次阻塞等待，不轮询；期间只读命令自动放行，其余等待用户决定。
+            try:
+                turn = rpc.wait(turn_id, args.relay)
+            except TimeoutError as error:
+                print(json.dumps({'event': 'relay_timeout', 'detail': str(error)},
+                                 ensure_ascii=False), flush=True)
+                turns = rpc.read_thread().get('turns', [])
+                turn = next((t for t in turns if t['id'] == turn_id), turn)
         result = result_for(turn) if turn else {'status': 'unknown', 'turnIds': [t['id'] for t in turns]}
-        write_json(Path(manifest['run']) / 'recovery.json', result)
+        write_json(run / 'recovery.json', result)
         if turn and result['status'] in TERMINAL:
             manifest['phase'] = result['status']
             write_json(path, manifest)
@@ -421,8 +576,11 @@ def main():
     for name in ('task', 'project', 'prompt'):
         s.add_argument('--' + name, required=True)
     s.add_argument('--mode', choices=('read-only', 'workspace-write'), required=True)
+    s.add_argument('--auto-approve', choices=('readonly', 'none'), default='readonly')
     r = sub.add_parser('recover')
     r.add_argument('--task', required=True)
+    r.add_argument('--auto-approve', choices=('readonly', 'none'), default='readonly')
+    r.add_argument('--relay', type=int, default=0)
     w = sub.add_parser('watch')
     w.add_argument('--run', required=True)
     w.add_argument('--seconds', type=int, default=1750)

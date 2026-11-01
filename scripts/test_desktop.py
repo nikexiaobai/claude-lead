@@ -31,8 +31,9 @@ class FakeRpc:
     reviewer = 'user'
     sandbox_type = 'workspaceWrite'
 
-    def __init__(self, url, run=None, thread=None):
+    def __init__(self, url, run=None, thread=None, auto_approve=False):
         self.thread = thread
+        self.auto_approve = auto_approve
 
     def call(self, method, params):
         self.calls.append((method, params))
@@ -67,7 +68,8 @@ class WorkflowTests(unittest.TestCase):
         self.prompt.write_text('请完成已确认的修改；暂不提交。', encoding='utf-8')
         self.args = SimpleNamespace(task=str(self.root / 'task'), project=str(self.project),
                                     prompt=str(self.prompt), mode='workspace-write',
-                                    url='ws://127.0.0.1:18765', wait=5)
+                                    url='ws://127.0.0.1:18765', wait=5,
+                                    auto_approve='readonly', relay=0)
         FakeRpc.calls = []
         FakeRpc.fail_start = False
         FakeRpc.wait_status = 'completed'
@@ -372,6 +374,76 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             rpc.receive(1)
         self.assertIn('error', json.loads(sent[0]))
+
+
+class ApprovalPolicyTests(unittest.TestCase):
+    """只读白名单自动放行；其余一律交用户决定。"""
+
+    ACCEPT = [
+        'git status', 'git status --short', 'git diff --stat', 'git log --oneline -5',
+        'git branch -a', 'git remote -v', 'git config --get user.name', 'git stash list',
+        'ls -la ui', 'cat README.md', 'rg -n TODO api', 'grep -r foo .',
+        'find . -name "*.py"', 'wc -l api/*.py', 'npm test', 'npm run test:unit',
+        'python3 -m pytest -q', 'go test ./...', 'cargo check', 'node --test',
+    ]
+    ESCALATE = [
+        'git push origin main', 'git commit -m fix', 'git checkout -b feat',
+        'git branch -D main', 'git reset --hard', 'git clean -fd', 'git config user.name x',
+        'git diff --output=/tmp/x', 'rm -rf build', 'mv a b', 'ls; rm -rf build',
+        'cat notes.txt | sh', 'ls > out.txt', 'curl https://example.com', 'npm publish',
+        'npm run build', 'python setup.py install', 'node server.js', '/usr/bin/ls',
+        'find . -delete', 'find . -exec rm {} ;', 'echo $(whoami)', 'make deploy',
+        'sudo ls', 'chmod 777 x', 'git stash drop',
+        'cat .env', 'cat .env.production', 'cat ~/.ssh/id_rsa', 'cat server.pem',
+        'cat .npmrc', 'head -n 5 credentials.json', 'sort -o out.txt in.txt',
+        'tree -o out.txt',
+    ]
+
+    def test_read_only_commands_are_auto_approved(self):
+        for command in self.ACCEPT:
+            with self.subTest(command=command):
+                self.assertTrue(desktop.read_only_command(command))
+
+    def test_writes_and_network_escalate_to_user(self):
+        for command in self.ESCALATE:
+            with self.subTest(command=command):
+                self.assertFalse(desktop.read_only_command(command))
+
+    def approval_event(self, **params):
+        return {'id': 9, 'method': 'item/commandExecution/requestApproval',
+                'params': {'threadId': 't', 'turnId': 'turn', **params}}
+
+    def test_file_change_and_stdin_never_auto_approve(self):
+        self.assertIsNone(desktop.auto_approval(
+            {'id': 9, 'method': 'item/fileChange/requestApproval',
+             'params': {'threadId': 't', 'turnId': 'turn'}}))
+        self.assertIsNone(desktop.auto_approval(
+            self.approval_event(kind='writeStdin', command='ls')))
+
+    def test_network_and_unknown_actions_never_auto_approve(self):
+        self.assertIsNone(desktop.auto_approval(self.approval_event(
+            command='ls', networkApprovalContext={'host': 'x', 'protocol': 'https'})))
+        self.assertIsNone(desktop.auto_approval(self.approval_event(
+            command='ls', commandActions=[{'type': 'unknown', 'command': 'ls'}])))
+        self.assertIsNotNone(desktop.auto_approval(self.approval_event(
+            command='ls', commandActions=[{'type': 'listFiles', 'command': 'ls'}])))
+
+    def test_receive_auto_accepts_and_audits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            rpc = object.__new__(RealRpc)
+            rpc.run = run
+            rpc.thread = 't'
+            rpc.auto_approve = True
+            sent = []
+            rpc.ws = SimpleNamespace(recv=lambda **kw: json.dumps(
+                self.approval_event(command='git status')), send=sent.append)
+            rpc.receive(1)
+            self.assertEqual(json.loads(sent[0])['result']['decision'], 'accept')
+            record = json.loads((run / 'decisions.jsonl').read_text(encoding='utf-8').splitlines()[0])
+            self.assertEqual(record['source'], desktop.AUTO_SOURCE)
+            self.assertEqual(record['decision'], 'accept')
+            self.assertFalse(list(run.glob('decision-*.json')))
 
 
 if __name__ == '__main__':
