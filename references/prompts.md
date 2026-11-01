@@ -89,3 +89,13 @@
 ```
 
 前提是mentor已独立审查，而不是只读Codex自述“完成”。提交后还要只读核对真实commit及远端任务分支。
+
+## 一句话需求的默认扩写（直接套用，不追问）
+
+**“做一个博客网站”**：Node 22 + Express + SQLite + EJS + bcryptjs + express-session（SQLite 持久化）+ marked；首页/详情/404；注册/登录/登出；后台文章增删改（仅作者本人）；bcrypt(10)、参数化 SQL、登录 regenerate、登出 destroy、HttpOnly+SameSite=Lax、Markdown 原始 HTML 转义；种子管理员 + 3 篇示例；node:test + supertest 覆盖认证关键路径。
+
+**“做一个后台管理系统”**：同上并加 `users.role`（admin/editor）；鉴权矩阵必须可测（未登录 302、角色不足 403、正常 200）；列表分页与搜索；测试覆盖越权访问。
+
+**“做一个中台”**：先产出「模块清单 + 数据模型 + 接口表」写入 `plan.md`；首期只做登录/鉴权 + 一个核心实体 CRUD + 审计日志；其余列 TODO，不一次铺开。
+
+验收统一按 `references/verification.md` 执行。
